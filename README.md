@@ -7,7 +7,7 @@ Fail-safe OTA rollback helper for ESP32 / ESP32-S3 projects (Arduino core or ESP
 - **Ping-pong protection**: configurable rollback guard prevents endless toggling between slots and optionally falls back to a factory partition.
 - **Controlled restarts**: mark intentional `ESP.restart()` calls so they never inflate crash counters.
 - **Safe OTA verification**: integrates with `ESP_OTA_IMG_PENDING_VERIFY` so passing health checks automatically marks the image as valid.
-- **Allocation-free rollback logic**: crash detection, NVS access, and rollback decisions avoid dynamic allocation; use buffer helpers when you need zero-heap label access.
+- **Allocation-free rollback logic**: crash detection, NVS access, and rollback decisions avoid dynamic allocation; `String` helpers exist only for optional convenience.
 
 ## Requirements
 - ESP32 or ESP32-S3 target
@@ -25,8 +25,8 @@ Add the directory to your PlatformIO project as a library dependency (already pr
 crg::CrashRollbackGuard guard;
 
 static bool myResetFilter(esp_reset_reason_t reason) {
-  // Example: ignore software resets triggered by your firmware
-  return (reason != ESP_RST_SW);
+  // Return true if the reset should count as suspicious/crash
+  return (reason != ESP_RST_SW); // treat SW resets as intentional
 }
 
 void setup() {
@@ -47,13 +47,16 @@ void setup() {
   guard.setOptions(opt);
   guard.setSuspiciousResetPredicate(myResetFilter);
 
-  guard.beginEarly();
+  const crg::Decision decision = guard.beginEarly();
+  if (decision == crg::Decision::Disabled) {
+    Serial.println("[CRG] Guard disabled due to invalid configuration");
+  }
 
   // start Wi-Fi, MQTT, etc.
 }
 
 void loop() {
-  guard.loopTick();  // Automatically marks image healthy after stableTimeMs
+  guard.loopTick();  // Call every loop so auto mark can trigger after stableTimeMs
 }
 
 void onAllServicesReady() {
@@ -66,6 +69,9 @@ void beforeSwitchingToNewOTA() {
   ESP.restart(); // esp_restart() is used internally by the guard
 }
 ```
+
+If `beginEarly()` ever returns `Decision::Disabled`, the guard detected a configuration issue (for example, an `nvsNamespace` longer than the NVS limit) and skipped its crash logic. Fix the configuration before relying on rollback decisions.
+`Decision::RollbackToPrev` / `Decision::RollbackToFactory` never return to the caller: the guard switches partitions and triggers `esp_restart()` immediately.
 
 ### Reading Slot Labels Without Heap Usage
 If you need to log or persist slot labels without constructing `String` objects, use the buffer-based helpers:
@@ -85,12 +91,12 @@ if (crg::CrashRollbackGuard::getRunningLabel(runningLabel, sizeof(runningLabel))
 ## Options Reference
 | Field | Description |
 | --- | --- |
-| `nvsNamespace` | Namespace used to store guard metadata (defaults to `"crg"`). |
+| `nvsNamespace` | Namespace used to store guard metadata (defaults to `"crg"`). Values longer than `CRG_NAMESPACE_MAX_LEN` characters (15 by default) disable the guard and make `beginEarly()` return `Decision::Disabled`. |
 | `failLimit` | Number of suspicious resets before rollback logic engages. `0` disables crash-based rollback logic entirely (use with caution). |
 | `stableTimeMs` | Milliseconds of uptime considered stable; `loopTick()` calls `markHealthyNow()` once this duration elapses. `0` disables the auto mark. |
 | `autoSavePrevSlot` | Automatically remember the running slot as the previous slot when none is stored. Best used when you do not manage slots manually. |
 | `logLevel` | `None`, `Error`, `Info`, or `Debug`. |
-| `logOutput` | `Print*` destination for logs (defaults to `&Serial`). Set to `nullptr` to silence logs. |
+| `logOutput` | `Print*` destination for logs (defaults to `&Serial`). Set to `nullptr` to silence logs entirely. |
 | `fallbackToFactory` | Attempt to boot the factory partition when rollback to the previous OTA slot fails or does not exist. |
 | `factoryLabel` | Partition label used for factory fallback. Only checked when `fallbackToFactory` is true. |
 | `maxRollbackAttempts` | Caps consecutive rollbacks between slots. `0` removes the guard (not recommended). |
@@ -123,9 +129,13 @@ Override via `platformio.ini` `build_flags`:
 
 ## Safety Notes
 - `Preferences` writes are minimized: fail counters and roll counts are mirrored with XOR values to detect corruption, and the guard writes only when necessary.
+- Writes only occur on suspicious resets (to bump fail counters), when marking healthy, or when explicitly saving slots/pending actions, minimizing flash wear when the device runs normally.
 - All partition labels saved in NVS include CRC32 checksums to detect torn writes or flash wear. Corrupted entries are cleared automatically.
 - Pending actions (rollback, factory fallback, controlled restarts) create a commit record before changing boot partitions. After the next boot, `beginEarly()` validates and clears the record so unexpected resets don’t cause double rollbacks.
 - The guard never uses dynamic allocation along critical paths, making it safe to run during brownout/WDT recovery windows.
+- The guard is designed for single-task access to `Preferences`. Call its APIs from one RTOS task (typical `loop()`/`setup()` flow) or guard invocations with your own mutex if accessed concurrently.
+- Factory fallback requires a partition table that defines OTA slots plus a factory image whose label matches `Options::factoryLabel`. Verify your Arduino/PlatformIO board definition uses a compatible `partitions.csv`.
+- `armControlledRestart()` is a one-shot marker: call it immediately before the restart that should be ignored, and it will be cleared on the very next boot.
 
 ## Troubleshooting
 | Symptom | Possible Cause | Mitigation |
@@ -133,7 +143,9 @@ Override via `platformio.ini` `build_flags`:
 | Guard logs "Stored prev slot label corrupted" | CRC mismatch, likely due to flash wear or power loss. | The guard already clears the entry; re-save the slot using `saveCurrentAsPreviousSlot()`. |
 | Rollback never triggers | `failLimit` too high or resets not classified as suspicious. | Lower `failLimit`, enable `swResetCountsAsCrash` / `brownoutCountsAsCrash`, or supply a custom predicate via `setSuspiciousResetPredicate()`. |
 | Device ping-pongs between two slots | `maxRollbackAttempts` set to `0`. | Set to `1` or more to stop repeated rollbacks without a successful health mark. |
+| Device still ping-pongs | Health mark never happens (no `markHealthyNow()` / `loopTick()`), so both slots keep failing. | Ensure `markHealthyNow()` runs after services are stable or keep `loopTick()` running with a non-zero `stableTimeMs`. |
 | Factory fallback ignored | `fallbackToFactory` disabled or `factoryLabel` missing in the partition table. | Ensure the label exists in `partitions.csv` and `Options::factoryLabel` matches exactly. |
+| `beginEarly()` returns `Decision::Disabled` | `nvsNamespace` exceeded the allowed length or was otherwise invalid. | Shorten the namespace to ≤15 characters (default limit) or stick with the default `"crg"`, then reboot. |
 
 ## Non-Goals
 - The guard does **not** download OTA images for you.
