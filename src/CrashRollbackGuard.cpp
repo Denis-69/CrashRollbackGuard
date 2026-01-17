@@ -27,10 +27,6 @@ void CrashRollbackGuard::setOptions(const Options& opt) {
   }
   opt_.factoryLabel = (ownedFactoryLabel_[0] == '\0') ? nullptr : ownedFactoryLabel_;
 
-  if (!opt_.logOutput) {
-    opt_.logOutput = &Serial;
-  }
-
 #if CRG_FEATURE_FACTORY_FALLBACK
   if (opt_.fallbackToFactory) {
     if (!opt_.factoryLabel || !findAppPartitionByLabel_(opt_.factoryLabel)) {
@@ -623,6 +619,12 @@ Decision CrashRollbackGuard::beginEarly() {
     prefs_.end();
     return Decision::None;
   }
+  
+  if (opt_.failLimit == 0) {
+    log(LogLevel::Debug, "[CRG] failLimit=0, watchdog disabled. Ignoring crash.\n");
+    prefs_.end();
+    return Decision::None;
+  }
 
 #if CRG_FEATURE_PENDING_VERIFY_FIX
   if (!pendingBoot && runningImgState_ == ESP_OTA_IMG_INVALID) {
@@ -632,12 +634,9 @@ Decision CrashRollbackGuard::beginEarly() {
   }
 #endif
 
-  if (fails < 0xFFFFFFFFu) {
-    const uint32_t cap = (opt_.failLimit > 0) ? opt_.failLimit : 0xFFFFFFFFu;
-    if (fails < cap) {
-      ++fails;
-      writeFailCounter_(prefs_, fails);
-    }
+  if (fails < opt_.failLimit) {
+    ++fails;
+    writeFailCounter_(prefs_, fails);
   }
 
   if (fails >= opt_.failLimit && opt_.failLimit > 0) {
