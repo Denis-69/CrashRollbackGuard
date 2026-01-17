@@ -1,0 +1,15 @@
+{
+  "name": "CrashRollbackGuard",
+  "version": "1.0.0",
+  "description": "Fail-safe crash-loop and OTA rollback guard for ESP32/ESP32-S3 devices.",
+  "keywords": ["esp32", "ota", "rollback", "crash", "watchdog", "boot", "partition"],
+  "authors": [
+    {
+      "name": "Denis-69",
+      "maintainer": true
+    }
+  ],
+  "license": "MIT",
+  "frameworks": ["arduino"],
+  "platforms": "espressif32"
+}
